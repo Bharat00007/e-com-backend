@@ -11,49 +11,49 @@ router.use(requireCustomerAuth);
  * Returns the authenticated customer's full wishlist with product details.
  */
 router.get('/', async (req: Request, res: Response) => {
-  const customerId = req.customer!.id;
+    const customerId = req.customer!.id;
 
-  const wishlist = await prisma.wishlist.findUnique({
-    where: { customerId },
-    include: {
-      items: {
+    const wishlist = await prisma.wishlist.findUnique({
+        where: { customerId },
         include: {
-          product: {
-            include: {
-              images: { orderBy: { isPrimary: 'desc' } },
-              variants: { where: { isAvailable: true } },
-              category: { select: { id: true, name: true, slug: true } },
+            items: {
+                include: {
+                    product: {
+                        include: {
+                            images: { orderBy: { isPrimary: 'desc' } },
+                            variants: { where: { isAvailable: true } },
+                            category: { select: { id: true, name: true, slug: true } },
+                        },
+                    },
+                },
+                orderBy: { createdAt: 'desc' },
             },
-          },
         },
-        orderBy: { createdAt: 'desc' },
-      },
-    },
-  });
-
-  if (!wishlist) {
-    return res.json({
-      success: true,
-      data: {
-        id: null,
-        customerId,
-        items: [],
-      },
     });
-  }
 
-  // Safely filter out items where product may have been soft-deleted/archived
-  const activeItems = wishlist.items.filter(
-    (item) => item.product && item.product.status === 'ACTIVE'
-  );
+    if (!wishlist) {
+        return res.json({
+            success: true,
+            data: {
+                id: null,
+                customerId,
+                items: [],
+            },
+        });
+    }
 
-  res.json({
-    success: true,
-    data: {
-      ...wishlist,
-      items: activeItems,
-    },
-  });
+    // Safely filter out items where product may have been soft-deleted/archived
+    const activeItems = wishlist.items.filter(
+        (item) => item.product && item.product.status === 'ACTIVE'
+    );
+
+    res.json({
+        success: true,
+        data: {
+            ...wishlist,
+            items: activeItems,
+        },
+    });
 });
 
 /**
@@ -61,48 +61,48 @@ router.get('/', async (req: Request, res: Response) => {
  * Toggles product addition / removal in customer's wishlist.
  */
 router.post('/toggle', async (req: Request, res: Response) => {
-  const customerId = req.customer!.id;
-  const { productId } = req.body as { productId?: string };
+    const customerId = req.customer!.id;
+    const { productId } = req.body as { productId?: string };
 
-  if (!productId) {
-    throw new BadRequestError('productId is required');
-  }
+    if (!productId) {
+        throw new BadRequestError('productId is required');
+    }
 
-  const product = await prisma.product.findUnique({
-    where: { id: productId },
-    select: { id: true, name: true, status: true },
-  });
-
-  if (!product || product.status !== 'ACTIVE') {
-    throw new NotFoundError('Product not found or currently unavailable');
-  }
-
-  const wishlist = await prisma.wishlist.upsert({
-    where: { customerId },
-    update: {},
-    create: { customerId },
-  });
-
-  const existing = await prisma.wishlistItem.findUnique({
-    where: { wishlistId_productId: { wishlistId: wishlist.id, productId } },
-  });
-
-  if (existing) {
-    await prisma.wishlistItem.delete({ where: { id: existing.id } });
-    return res.json({
-      success: true,
-      data: { added: false, productId, message: 'Product removed from wishlist' },
+    const product = await prisma.product.findUnique({
+        where: { id: productId },
+        select: { id: true, name: true, status: true },
     });
-  }
 
-  await prisma.wishlistItem.create({
-    data: { wishlistId: wishlist.id, productId },
-  });
+    if (!product || product.status !== 'ACTIVE') {
+        throw new NotFoundError('Product not found or currently unavailable');
+    }
 
-  res.status(201).json({
-    success: true,
-    data: { added: true, productId, message: 'Product added to wishlist' },
-  });
+    const wishlist = await prisma.wishlist.upsert({
+        where: { customerId },
+        update: {},
+        create: { customerId },
+    });
+
+    const existing = await prisma.wishlistItem.findUnique({
+        where: { wishlistId_productId: { wishlistId: wishlist.id, productId } },
+    });
+
+    if (existing) {
+        await prisma.wishlistItem.delete({ where: { id: existing.id } });
+        return res.json({
+            success: true,
+            data: { added: false, productId, message: 'Product removed from wishlist' },
+        });
+    }
+
+    await prisma.wishlistItem.create({
+        data: { wishlistId: wishlist.id, productId },
+    });
+
+    res.status(201).json({
+        success: true,
+        data: { added: true, productId, message: 'Product added to wishlist' },
+    });
 });
 
 /**
@@ -110,74 +110,74 @@ router.post('/toggle', async (req: Request, res: Response) => {
  * Merges an array of product IDs saved by a guest into the customer's authenticated wishlist.
  */
 router.post('/merge', async (req: Request, res: Response) => {
-  const customerId = req.customer!.id;
-  const { productIds } = req.body as { productIds?: string[] };
+    const customerId = req.customer!.id;
+    const { productIds } = req.body as { productIds?: string[] };
 
-  if (!Array.isArray(productIds) || productIds.length === 0) {
-    return res.json({
-      success: true,
-      data: { mergedCount: 0, productIds: [] },
+    if (!Array.isArray(productIds) || productIds.length === 0) {
+        return res.json({
+            success: true,
+            data: { mergedCount: 0, productIds: [] },
+        });
+    }
+
+    // Filter valid, existing active products
+    const validProducts = await prisma.product.findMany({
+        where: {
+            id: { in: productIds },
+            status: 'ACTIVE',
+        },
+        select: { id: true },
     });
-  }
 
-  // Filter valid, existing active products
-  const validProducts = await prisma.product.findMany({
-    where: {
-      id: { in: productIds },
-      status: 'ACTIVE',
-    },
-    select: { id: true },
-  });
+    const validIds = validProducts.map((p) => p.id);
 
-  const validIds = validProducts.map((p) => p.id);
+    if (validIds.length === 0) {
+        return res.json({
+            success: true,
+            data: { mergedCount: 0, productIds: [] },
+        });
+    }
 
-  if (validIds.length === 0) {
-    return res.json({
-      success: true,
-      data: { mergedCount: 0, productIds: [] },
+    const wishlist = await prisma.wishlist.upsert({
+        where: { customerId },
+        update: {},
+        create: { customerId },
     });
-  }
 
-  const wishlist = await prisma.wishlist.upsert({
-    where: { customerId },
-    update: {},
-    create: { customerId },
-  });
-
-  // Find existing items to prevent duplicates
-  const existingItems = await prisma.wishlistItem.findMany({
-    where: {
-      wishlistId: wishlist.id,
-      productId: { in: validIds },
-    },
-    select: { productId: true },
-  });
-
-  const existingSet = new Set(existingItems.map((i) => i.productId));
-  const toAdd = validIds.filter((id) => !existingSet.has(id));
-
-  if (toAdd.length > 0) {
-    await prisma.wishlistItem.createMany({
-      data: toAdd.map((productId) => ({
-        wishlistId: wishlist.id,
-        productId,
-      })),
-      skipDuplicates: true,
+    // Find existing items to prevent duplicates
+    const existingItems = await prisma.wishlistItem.findMany({
+        where: {
+            wishlistId: wishlist.id,
+            productId: { in: validIds },
+        },
+        select: { productId: true },
     });
-  }
 
-  const allItems = await prisma.wishlistItem.findMany({
-    where: { wishlistId: wishlist.id },
-    select: { productId: true },
-  });
+    const existingSet = new Set(existingItems.map((i) => i.productId));
+    const toAdd = validIds.filter((id) => !existingSet.has(id));
 
-  res.json({
-    success: true,
-    data: {
-      mergedCount: toAdd.length,
-      productIds: allItems.map((i) => i.productId),
-    },
-  });
+    if (toAdd.length > 0) {
+        await prisma.wishlistItem.createMany({
+            data: toAdd.map((productId) => ({
+                wishlistId: wishlist.id,
+                productId,
+            })),
+            skipDuplicates: true,
+        });
+    }
+
+    const allItems = await prisma.wishlistItem.findMany({
+        where: { wishlistId: wishlist.id },
+        select: { productId: true },
+    });
+
+    res.json({
+        success: true,
+        data: {
+            mergedCount: toAdd.length,
+            productIds: allItems.map((i) => i.productId),
+        },
+    });
 });
 
 /**
@@ -185,46 +185,46 @@ router.post('/merge', async (req: Request, res: Response) => {
  * Adds a product to customer's wishlist.
  */
 router.post('/:productId', async (req: Request, res: Response) => {
-  const customerId = req.customer!.id;
-  const productId = String(req.params.productId);
+    const customerId = req.customer!.id;
+    const productId = String(req.params.productId);
 
-  if (!productId || productId === 'undefined') {
-    throw new BadRequestError('Valid productId is required');
-  }
+    if (!productId || productId === 'undefined') {
+        throw new BadRequestError('Valid productId is required');
+    }
 
-  const product = await prisma.product.findUnique({
-    where: { id: productId },
-    select: { id: true, name: true, status: true },
-  });
-
-  if (!product || product.status !== 'ACTIVE') {
-    throw new NotFoundError('Product not found or currently unavailable');
-  }
-
-  const wishlist = await prisma.wishlist.upsert({
-    where: { customerId },
-    update: {},
-    create: { customerId },
-  });
-
-  const existing = await prisma.wishlistItem.findUnique({
-    where: { wishlistId_productId: { wishlistId: wishlist.id, productId } },
-  });
-
-  if (!existing) {
-    await prisma.wishlistItem.create({
-      data: { wishlistId: wishlist.id, productId },
+    const product = await prisma.product.findUnique({
+        where: { id: productId },
+        select: { id: true, name: true, status: true },
     });
-  }
 
-  res.status(201).json({
-    success: true,
-    data: {
-      added: true,
-      productId,
-      message: 'Product added to wishlist',
-    },
-  });
+    if (!product || product.status !== 'ACTIVE') {
+        throw new NotFoundError('Product not found or currently unavailable');
+    }
+
+    const wishlist = await prisma.wishlist.upsert({
+        where: { customerId },
+        update: {},
+        create: { customerId },
+    });
+
+    const existing = await prisma.wishlistItem.findUnique({
+        where: { wishlistId_productId: { wishlistId: wishlist.id, productId } },
+    });
+
+    if (!existing) {
+        await prisma.wishlistItem.create({
+            data: { wishlistId: wishlist.id, productId },
+        });
+    }
+
+    res.status(201).json({
+        success: true,
+        data: {
+            added: true,
+            productId,
+            message: 'Product added to wishlist',
+        },
+    });
 });
 
 /**
@@ -232,34 +232,34 @@ router.post('/:productId', async (req: Request, res: Response) => {
  * Removes a product from customer's wishlist.
  */
 router.delete('/:productId', async (req: Request, res: Response) => {
-  const customerId = req.customer!.id;
-  const productId = String(req.params.productId);
+    const customerId = req.customer!.id;
+    const productId = String(req.params.productId);
 
-  if (!productId || productId === 'undefined') {
-    throw new BadRequestError('Valid productId is required');
-  }
+    if (!productId || productId === 'undefined') {
+        throw new BadRequestError('Valid productId is required');
+    }
 
-  const wishlist = await prisma.wishlist.findUnique({
-    where: { customerId },
-  });
-
-  if (wishlist) {
-    await prisma.wishlistItem.deleteMany({
-      where: {
-        wishlistId: wishlist.id,
-        productId,
-      },
+    const wishlist = await prisma.wishlist.findUnique({
+        where: { customerId },
     });
-  }
 
-  res.json({
-    success: true,
-    data: {
-      removed: true,
-      productId,
-      message: 'Product removed from wishlist',
-    },
-  });
+    if (wishlist) {
+        await prisma.wishlistItem.deleteMany({
+            where: {
+                wishlistId: wishlist.id,
+                productId,
+            },
+        });
+    }
+
+    res.json({
+        success: true,
+        data: {
+            removed: true,
+            productId,
+            message: 'Product removed from wishlist',
+        },
+    });
 });
 
 export default router;
