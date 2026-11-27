@@ -96,12 +96,14 @@ router.get('/session', async (req: Request, res: Response) => {
 });
 
 async function mergeGuestCart(req: Request, customerId: string) {
-    const guestToken = req.cookies?.guestCartToken as string | undefined;
+    const guestToken =
+        (req.headers['x-guest-cart-token'] as string | undefined) ||
+        (req.cookies?.guestCartToken as string | undefined);
     if (!guestToken) return;
 
     const guestCart = await prisma.cart.findUnique({
         where: { guestToken },
-        include: { items: true },
+        include: { items: { include: { variant: true } } },
     });
     if (!guestCart) return;
     if (guestCart.items.length === 0) {
@@ -127,17 +129,20 @@ async function mergeGuestCart(req: Request, customerId: string) {
     const txOps = [
         ...guestCart.items.map((item) => {
             const existing = existingMap.get(`${item.variantId}:${item.isSubscription}`);
+            const maxStock = item.variant?.stockQuantity ?? 20;
             if (existing) {
+                const combinedQty = Math.min(existing.quantity + item.quantity, maxStock);
                 return prisma.cartItem.update({
                     where: { id: existing.id },
-                    data: { quantity: existing.quantity + item.quantity },
+                    data: { quantity: combinedQty },
                 });
             }
+            const cappedQty = Math.min(item.quantity, maxStock);
             return prisma.cartItem.create({
                 data: {
                     cartId: customerCart.id,
                     variantId: item.variantId,
-                    quantity: item.quantity,
+                    quantity: cappedQty,
                     isSubscription: item.isSubscription,
                     frequencyWeeks: item.frequencyWeeks,
                 },

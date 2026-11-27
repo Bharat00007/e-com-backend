@@ -14,8 +14,150 @@ const cartCalculator_1 = require("../services/cartCalculator");
 const shippingProvider_1 = require("../services/shippingProvider");
 const paymentGateway_1 = require("../services/paymentGateway");
 const router = (0, express_1.Router)();
-router.use(auth_1.requireCustomerAuth);
-router.post('/create-order', (0, validate_1.validate)(schemas_1.checkoutCreateOrderSchema), async (req, res) => {
+/**
+ * @openapi
+ * /checkout/quote:
+ *   post:
+ *     summary: Retrieve authoritative checkout summary & price calculation from backend database
+ */
+router.post('/quote', auth_1.optionalCustomerAuth, async (req, res) => {
+    const { shippingMethod = 'standard', couponCode, pincode } = req.body;
+    let cart = null;
+    if (req.customer) {
+        cart = await prisma_1.prisma.cart.findUnique({
+            where: { customerId: req.customer.id },
+            include: {
+                items: {
+                    include: {
+                        variant: {
+                            include: {
+                                product: {
+                                    include: { images: { where: { isPrimary: true } } },
+                                },
+                            },
+                        },
+                    },
+                    orderBy: { createdAt: 'asc' },
+                },
+            },
+        });
+    }
+    else {
+        const guestToken = req.headers['x-guest-cart-token']?.trim() ||
+            req.cookies?.guestCartToken?.trim();
+        if (guestToken) {
+            cart = await prisma_1.prisma.cart.findUnique({
+                where: { guestToken },
+                include: {
+                    items: {
+                        include: {
+                            variant: {
+                                include: {
+                                    product: {
+                                        include: { images: { where: { isPrimary: true } } },
+                                    },
+                                },
+                            },
+                        },
+                        orderBy: { createdAt: 'asc' },
+                    },
+                },
+            });
+        }
+    }
+    if (!cart || cart.items.length === 0) {
+        return res.json({
+            success: true,
+            data: {
+                items: [],
+                totals: {
+                    subtotal: 0,
+                    subscriptionDiscount: 0,
+                    couponDiscount: 0,
+                    shippingCharge: 0,
+                    taxAmount: 0,
+                    totalAmount: 0,
+                    totalSavings: 0,
+                },
+                couponCode: null,
+                shippingMethod,
+                isValid: false,
+                validationErrors: ['Cart is empty'],
+            },
+        });
+    }
+    const activeCouponCode = couponCode?.trim().toUpperCase() || cart.couponCode;
+    const coupon = activeCouponCode
+        ? await prisma_1.prisma.coupon.findUnique({ where: { code: activeCouponCode } })
+        : null;
+    const validationErrors = [];
+    const quotedItems = cart.items.map((item) => {
+        const variant = item.variant;
+        const product = variant.product;
+        const unitPrice = variant.salePrice ?? variant.price;
+        const isOutOfStock = !variant.isAvailable || variant.stockQuantity < item.quantity;
+        if (isOutOfStock) {
+            validationErrors.push(`${product.shortName} (${variant.packSizeLabel}) has only ${variant.stockQuantity} units available.`);
+        }
+        const subscriptionDiscountPercent = item.isSubscription
+            ? product.subscriptionDiscountPercent
+            : 0;
+        const discountApplied = item.isSubscription
+            ? Math.round((unitPrice * item.quantity * subscriptionDiscountPercent) / 100)
+            : 0;
+        return {
+            id: item.id,
+            variantId: item.variantId,
+            productId: product.id,
+            name: product.name,
+            packSizeLabel: variant.packSizeLabel,
+            image: product.images[0]?.url ?? null,
+            unitPrice,
+            quantity: item.quantity,
+            isSubscription: item.isSubscription,
+            frequencyWeeks: item.frequencyWeeks,
+            lineTotal: unitPrice * item.quantity - discountApplied,
+            discountApplied,
+            stockAvailable: variant.stockQuantity,
+            isOutOfStock,
+        };
+    });
+    if (pincode && pincode.trim().length === 6) {
+        try {
+            const serviceability = await (0, shippingProvider_1.checkPincodeServiceability)(pincode.trim());
+            if (!serviceability.serviceable) {
+                validationErrors.push(`PIN code ${pincode} is not serviceable.`);
+            }
+        }
+        catch {
+            // Ignore pincode check error on quote
+        }
+    }
+    const totals = (0, cartCalculator_1.calculateCartTotals)(cart.items.map((i) => ({
+        unitPrice: i.variant.salePrice ?? i.variant.price,
+        quantity: i.quantity,
+        isSubscription: i.isSubscription,
+        subscriptionDiscountPercent: i.variant.product.subscriptionDiscountPercent,
+    })), { coupon, shippingMethod });
+    res.json({
+        success: true,
+        data: {
+            items: quotedItems,
+            totals,
+            couponCode: coupon?.code ?? null,
+            shippingMethod,
+            isValid: validationErrors.length === 0,
+            validationErrors,
+        },
+    });
+});
+/**
+ * @openapi
+ * /checkout/create-order:
+ *   post:
+ *     summary: Place authenticated order with 100% backend-authoritative calculation
+ */
+router.post('/create-order', auth_1.requireCustomerAuth, (0, validate_1.validate)(schemas_1.checkoutCreateOrderSchema), async (req, res) => {
     const { idempotencyKey, contactEmail, contactPhone, shippingAddress, shippingMethod, paymentMethod, couponCode, } = req.body;
     // Idempotency check to prevent duplicate orders (scoped to owning customer)
     if (idempotencyKey) {
@@ -52,6 +194,7 @@ router.post('/create-order', (0, validate_1.validate)(schemas_1.checkoutCreateOr
     const coupon = activeCouponCode
         ? await prisma_1.prisma.coupon.findUnique({ where: { code: activeCouponCode } })
         : null;
+    // Authoritative price calculation purely from database records (client prices ignored)
     const totals = (0, cartCalculator_1.calculateCartTotals)(cart.items.map((i) => ({
         unitPrice: i.variant.salePrice ?? i.variant.price,
         quantity: i.quantity,
@@ -62,7 +205,7 @@ router.post('/create-order', (0, validate_1.validate)(schemas_1.checkoutCreateOr
     // Verify stock availability before atomic batch transaction
     for (const item of cart.items) {
         if (!item.variant.isAvailable || item.variant.stockQuantity < item.quantity) {
-            throw new errors_1.BadRequestError(`Insufficient stock for ${item.variant.product.shortName} (${item.variant.packSizeLabel})`);
+            throw new errors_1.BadRequestError(`Insufficient stock for ${item.variant.product.shortName} (${item.variant.packSizeLabel}). Available: ${item.variant.stockQuantity}`);
         }
     }
     const orderId = crypto_1.default.randomUUID();

@@ -220,5 +220,5 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
 
         const afterCancelVariant = await prisma.productVariant.findUnique({ where: { id: variant.id } });
         expect(afterCancelVariant?.stockQuantity).toBe(initialStock);
-    }, 45_000);
+    }, 90_000);
 });

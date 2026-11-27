@@ -4,7 +4,7 @@ import { env } from '../config/env';
 /** Returns consistent HTTP-only cookie attributes across auth and guest cart routes. */
 export function buildCookieOptions(maxAge?: number): CookieOptions {
   const isProd = env.NODE_ENV === 'production';
-  const sameSite = env.COOKIE_SAME_SITE ?? 'lax';
+  const sameSite = env.COOKIE_SAME_SITE ?? (isProd ? 'none' : 'lax');
   const secure = isProd || sameSite === 'none';
 
   return {

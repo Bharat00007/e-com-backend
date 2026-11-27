@@ -66,6 +66,7 @@ export function createApp() {
     }
   };
 
+  app.get('/', healthHandler);
   app.get('/health', healthHandler);
   app.get('/api/health', healthHandler);
   app.get('/api/v1/health', healthHandler);
