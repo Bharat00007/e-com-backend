@@ -16,23 +16,33 @@ export function createApp() {
     .map((o) => o.trim())
     .filter(Boolean);
 
+  const isOriginAllowed = (origin?: string): boolean => {
+    if (!origin) return true;
+    if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return true;
+    // Allow any localhost or 127.0.0.1 port (frontend dev server, Swagger UI on 4000, etc.)
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
+      return true;
+    }
+    // Allow any Vercel deployment domain
+    if (/^https?:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin)) {
+      return true;
+    }
+    return false;
+  };
+
   app.set('trust proxy', 1);
   app.use(helmet());
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (
-          !origin ||
-          allowedOrigins.includes('*') ||
-          allowedOrigins.includes(origin) ||
-          origin.endsWith('.vercel.app')
-        ) {
+        if (isOriginAllowed(origin)) {
           callback(null, true);
           return;
         }
-        callback(new Error('Origin not allowed by CORS'));
+        callback(null, false);
       },
       credentials: true,
+      exposedHeaders: ['x-auth-token', 'x-guest-cart-token'],
     })
   );
   app.use(cookieParser());

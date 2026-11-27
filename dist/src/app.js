@@ -34,6 +34,7 @@ function createApp() {
             callback(new Error('Origin not allowed by CORS'));
         },
         credentials: true,
+        exposedHeaders: ['x-auth-token', 'x-guest-cart-token'],
     }));
     app.use((0, cookie_parser_1.default)());
     app.use(express_1.default.json({ limit: '1mb' }));

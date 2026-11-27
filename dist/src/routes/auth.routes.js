@@ -401,7 +401,15 @@ router.post('/verify-otp', rateLimit_1.otpVerifyLimiter, (0, validate_1.validate
     });
     await mergeGuestCart(req, customer.id);
     setAuthCookies(res, accessToken, refreshToken);
-    res.status(201).json({ success: true, data: { customer } });
+    res.setHeader('x-auth-token', accessToken);
+    res.status(201).json({
+        success: true,
+        data: {
+            token: accessToken,
+            accessToken,
+            customer,
+        },
+    });
 });
 /**
  * @openapi
@@ -569,9 +577,12 @@ router.post('/login', rateLimit_1.authLimiter, (0, validate_1.validate)(schemas_
     });
     await mergeGuestCart(req, customer.id);
     setAuthCookies(res, accessToken, refreshToken);
+    res.setHeader('x-auth-token', accessToken);
     res.json({
         success: true,
         data: {
+            token: accessToken,
+            accessToken,
             customer: {
                 id: customer.id,
                 fullName: customer.fullName,
@@ -629,7 +640,14 @@ router.post('/refresh', async (req, res) => {
         role: payload.role,
     });
     res.cookie('accessToken', accessToken, (0, cookies_1.buildCookieOptions)(15 * 60 * 1000));
-    res.json({ success: true });
+    res.setHeader('x-auth-token', accessToken);
+    res.json({
+        success: true,
+        data: {
+            token: accessToken,
+            accessToken,
+        },
+    });
 });
 router.post('/logout', async (req, res) => {
     const token = req.cookies?.refreshToken;

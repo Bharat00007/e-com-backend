@@ -269,7 +269,7 @@ router.patch('/orders/:id/status', (0, auth_1.requireAdminRole)('ORDER_MANAGER')
                 history: { orderBy: { createdAt: 'desc' } },
             },
         });
-    });
+    }, { maxWait: 15000, timeout: 30000 });
     await logAdminAction(req, 'UPDATE_ORDER_STATUS', 'Order', updated.id, {
         previousStatus: existingOrder.status,
         newStatus: status,
