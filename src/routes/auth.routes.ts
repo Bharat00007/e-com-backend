@@ -25,7 +25,26 @@ import {
     verifyAccessToken,
     verifyRefreshToken,
 } from '../utils/jwt';
-import { buildCookieOptions } from '../utils/cookies';
+import {
+    buildCookieOptions,
+    clearGuestSessionCookies,
+    clearLegacyAndSessionCookies,
+    clearLegacyJwtCookies,
+    CSRF_NONCE_COOKIE,
+    CUSTOMER_SESSION_COOKIE,
+    GUEST_SESSION_COOKIE,
+} from '../utils/cookies';
+import {
+    clearMergedGuestCookie,
+    computeSessionCsrfToken,
+    createGuestSession,
+    issuePreAuthCsrfCookie,
+    mergeGuestSessionCartAtomically,
+    revokeCustomerSession,
+    rotateCustomerSession,
+    validateCustomerSession,
+    validateGuestSession,
+} from '../services/sessionService';
 import { generateSixDigitOtp, hashOtp, maskEmail, verifyOtpHash } from '../utils/otp';
 import {
     getEmailConfigurationStatus,
@@ -56,107 +75,117 @@ router.get('/email-configuration-status', (_req: Request, res: Response) => {
     res.json({ success: true, data: getEmailConfigurationStatus() });
 });
 
-router.get('/session', async (req: Request, res: Response) => {
-    const cookieToken = req.cookies?.accessToken as string | undefined;
-    const authHeader = req.headers.authorization;
-    const token = cookieToken ?? (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined);
-
-    if (!token) {
-        res.json({ success: true, data: { authenticated: false, customer: null } });
-        return;
-    }
-
-    try {
-        const payload = verifyAccessToken(token);
-        if (payload.type !== 'customer') {
-            res.json({ success: true, data: { authenticated: false, customer: null } });
+router.get('/csrf', async (req: Request, res: Response) => {
+    const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    if (sidCookie) {
+        const validated = await validateCustomerSession(sidCookie);
+        if (validated) {
+            const csrfToken = computeSessionCsrfToken(validated.session.id, validated.session.csrfSecret);
+            res.setHeader('x-csrf-token', csrfToken);
+            res.json({ success: true, data: { csrfToken } });
             return;
         }
-        const customer = await prisma.customer.findUnique({
-            where: { id: payload.sub },
-            select: {
-                id: true,
-                fullName: true,
-                email: true,
-                phone: true,
-                emailVerified: true,
-                marketingConsent: true,
-                status: true,
-            },
-        });
-        if (!customer || customer.status !== 'ACTIVE') {
-            res.json({ success: true, data: { authenticated: false, customer: null } });
+    }
+
+    const gsidCookie = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+    if (gsidCookie) {
+        const guestSession = await validateGuestSession(gsidCookie);
+        if (guestSession) {
+            const csrfToken = computeSessionCsrfToken(guestSession.id, guestSession.csrfSecret);
+            res.setHeader('x-csrf-token', csrfToken);
+            res.json({ success: true, data: { csrfToken } });
             return;
         }
-        const { status: _status, ...safeCustomer } = customer;
-        res.json({ success: true, data: { authenticated: true, customer: safeCustomer } });
-    } catch {
-        res.json({ success: true, data: { authenticated: false, customer: null } });
     }
+
+    const csrfToken = issuePreAuthCsrfCookie(req, res);
+    res.json({ success: true, data: { csrfToken } });
 });
 
-async function mergeGuestCart(req: Request, customerId: string) {
-    const guestToken =
-        (req.headers['x-guest-cart-token'] as string | undefined) ||
-        (req.cookies?.guestCartToken as string | undefined);
-    if (!guestToken) return;
-
-    const guestCart = await prisma.cart.findUnique({
-        where: { guestToken },
-        include: { items: { include: { variant: true } } },
-    });
-    if (!guestCart) return;
-    if (guestCart.items.length === 0) {
-        await prisma.cart.delete({ where: { id: guestCart.id } });
-        return;
-    }
-
-    let customerCart = await prisma.cart.findUnique({
-        where: { customerId },
-        include: { items: true },
-    });
-    if (!customerCart) {
-        customerCart = await prisma.cart.create({
-            data: { customerId },
-            include: { items: true },
-        });
-    }
-
-    const existingMap = new Map(
-        customerCart.items.map((ci) => [`${ci.variantId}:${ci.isSubscription}`, ci])
-    );
-
-    const txOps = [
-        ...guestCart.items.map((item) => {
-            const existing = existingMap.get(`${item.variantId}:${item.isSubscription}`);
-            const maxStock = item.variant?.stockQuantity ?? 20;
-            if (existing) {
-                const combinedQty = Math.min(existing.quantity + item.quantity, maxStock);
-                return prisma.cartItem.update({
-                    where: { id: existing.id },
-                    data: { quantity: combinedQty },
-                });
-            }
-            const cappedQty = Math.min(item.quantity, maxStock);
-            return prisma.cartItem.create({
+router.get('/session', async (req: Request, res: Response) => {
+    // 1. Validate server-managed PostgreSQL CustomerSession (`sid` HttpOnly cookie)
+    const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    if (sidCookie) {
+        const validated = await validateCustomerSession(sidCookie);
+        if (validated) {
+            const csrfToken = computeSessionCsrfToken(validated.session.id, validated.session.csrfSecret);
+            res.setHeader('x-csrf-token', csrfToken);
+            const { status: _status, ...safeCustomer } = validated.customer;
+            res.json({
+                success: true,
                 data: {
-                    cartId: customerCart.id,
-                    variantId: item.variantId,
-                    quantity: cappedQty,
-                    isSubscription: item.isSubscription,
-                    frequencyWeeks: item.frequencyWeeks,
+                    authenticated: true,
+                    customer: safeCustomer,
+                    csrfToken,
                 },
             });
-        }),
-        prisma.cart.delete({ where: { id: guestCart.id } }),
-    ];
+            return;
+        }
+        // Clear invalid/revoked/expired session cookie
+        clearLegacyAndSessionCookies(res, req);
+    } else {
+        // Check explicit Bearer token ONLY when no `sid` cookie is present
+        const authHeader = req.headers.authorization;
+        const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
+        if (bearerToken) {
+            try {
+                const payload = verifyAccessToken(bearerToken);
+                if (payload.type === 'customer') {
+                    const customer = await prisma.customer.findUnique({
+                        where: { id: payload.sub },
+                        select: {
+                            id: true,
+                            fullName: true,
+                            email: true,
+                            phone: true,
+                            emailVerified: true,
+                            marketingConsent: true,
+                            status: true,
+                        },
+                    });
+                    if (customer && customer.status === 'ACTIVE') {
+                        const { status: _status, ...safeCustomer } = customer;
+                        res.json({ success: true, data: { authenticated: true, customer: safeCustomer } });
+                        return;
+                    }
+                }
+            } catch {
+                // Invalid bearer token falls through to isolated guest session
+            }
+        }
+    }
 
-    await prisma.$transaction(txOps);
-}
+    // 2. Ensure unauthenticated browser visitors receive/reuse an isolated PostgreSQL GuestSession
+    const existingGsid = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+    let guestSession = existingGsid ? await validateGuestSession(existingGsid) : null;
+    let csrfToken: string;
 
-function setAuthCookies(res: Response, accessToken: string, refreshToken: string) {
-    res.cookie('accessToken', accessToken, buildCookieOptions(15 * 60 * 1000));
-    res.cookie('refreshToken', refreshToken, buildCookieOptions(7 * 24 * 60 * 60 * 1000));
+    if (guestSession) {
+        csrfToken = computeSessionCsrfToken(guestSession.id, guestSession.csrfSecret);
+        res.setHeader('x-csrf-token', csrfToken);
+    } else {
+        if (existingGsid) {
+            clearGuestSessionCookies(res, req);
+        }
+        const created = await createGuestSession(req, res);
+        guestSession = created.session;
+        csrfToken = created.csrfToken;
+    }
+
+    res.json({
+        success: true,
+        data: {
+            authenticated: false,
+            customer: null,
+            hasGuestSession: true,
+            csrfToken,
+        },
+    });
+});
+
+function setAdminAuthCookies(req: Request, res: Response, accessToken: string, refreshToken: string) {
+    res.cookie('accessToken', accessToken, buildCookieOptions(15 * 60 * 1000, req));
+    res.cookie('refreshToken', refreshToken, buildCookieOptions(7 * 24 * 60 * 60 * 1000, req));
 }
 
 /**
@@ -498,27 +527,22 @@ router.post('/verify-otp', otpVerifyLimiter, validate(verifyOtpSchema), async (r
         { timeout: 15000, maxWait: 10000 }
     );
 
-    const payload = { sub: customer.id, type: 'customer' as const };
-    const accessToken = signAccessToken(payload);
-    const refreshToken = signRefreshToken(payload);
+    const gsidCookie = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+    const guestSession = gsidCookie ? await validateGuestSession(gsidCookie) : null;
 
-    await prisma.refreshToken.create({
-        data: {
-            tokenHash: hashToken(refreshToken),
-            customerId: customer.id,
-            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-        },
-    });
+    const priorSid = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    clearLegacyJwtCookies(res, req);
+    const { csrfToken } = await rotateCustomerSession(req, res, customer.id, priorSid, true);
 
-    await mergeGuestCart(req, customer.id);
-    setAuthCookies(res, accessToken, refreshToken);
-    res.setHeader('x-auth-token', accessToken);
+    const mergeResult = await mergeGuestSessionCartAtomically(guestSession?.id, customer.id);
+    clearMergedGuestCookie(res, req);
+
     res.status(201).json({
         success: true,
         data: {
-            token: accessToken,
-            accessToken,
             customer,
+            cartMerged: mergeResult.mergedCount > 0,
+            csrfToken,
         },
     });
 });
@@ -671,10 +695,11 @@ router.post('/resend-otp', otpResendLimiter, validate(resendOtpSchema), async (r
 });
 
 router.post('/login', authLimiter, validate(loginSchema), async (req: Request, res: Response) => {
-    const { email: rawEmail, identifier: rawIdentifier, password } = req.body as {
+    const { email: rawEmail, identifier: rawIdentifier, password, rememberMe } = req.body as {
         email?: string;
         identifier?: string;
         password: string;
+        rememberMe?: boolean;
     };
     const trimmed = (rawEmail ?? rawIdentifier ?? '').trim();
     const normalizedPhone = !trimmed.includes('@') ? normalizeIndianMobile(trimmed) : null;
@@ -720,26 +745,28 @@ router.post('/login', authLimiter, validate(loginSchema), async (req: Request, r
         throw new UnauthorizedError('Account is suspended or inactive');
     }
 
-    const payload = { sub: customer.id, type: 'customer' as const };
-    const accessToken = signAccessToken(payload);
-    const refreshToken = signRefreshToken(payload);
+    // 1. Validate any active pre-login guest session before rotating customer session
+    const gsidCookie = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+    const guestSession = gsidCookie ? await validateGuestSession(gsidCookie) : null;
 
-    await prisma.refreshToken.create({
-        data: {
-            tokenHash: hashToken(refreshToken),
-            customerId: customer.id,
-            expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-        },
-    });
+    // 2. Rotate CustomerSession in PostgreSQL to prevent session fixation & clear legacy JWT cookies
+    const priorSid = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    clearLegacyJwtCookies(res, req);
+    const { csrfToken } = await rotateCustomerSession(
+        req,
+        res,
+        customer.id,
+        priorSid,
+        rememberMe ?? true
+    );
 
-    await mergeGuestCart(req, customer.id);
-    setAuthCookies(res, accessToken, refreshToken);
-    res.setHeader('x-auth-token', accessToken);
+    // 3. Merge ONLY this guest session's cart atomically and consume the guest session
+    const mergeResult = await mergeGuestSessionCartAtomically(guestSession?.id, customer.id);
+    clearMergedGuestCookie(res, req);
+
     res.json({
         success: true,
         data: {
-            token: accessToken,
-            accessToken,
             customer: {
                 id: customer.id,
                 fullName: customer.fullName,
@@ -748,6 +775,8 @@ router.post('/login', authLimiter, validate(loginSchema), async (req: Request, r
                 emailVerified: customer.emailVerified,
                 marketingConsent: customer.marketingConsent,
             },
+            cartMerged: mergeResult.mergedCount > 0,
+            csrfToken,
         },
     });
 });
@@ -779,7 +808,7 @@ router.post('/admin/login', authLimiter, validate(loginSchema), async (req: Requ
         },
     });
 
-    setAuthCookies(res, accessToken, refreshToken);
+    setAdminAuthCookies(req, res, accessToken, refreshToken);
     res.json({
         success: true,
         data: {
@@ -790,8 +819,32 @@ router.post('/admin/login', authLimiter, validate(loginSchema), async (req: Requ
 });
 
 router.post('/refresh', async (req: Request, res: Response) => {
+    const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    if (sidCookie) {
+        const validated = await validateCustomerSession(sidCookie);
+        if (!validated) {
+            clearLegacyAndSessionCookies(res, req);
+            throw new UnauthorizedError('Session expired or revoked');
+        }
+        const { csrfToken } = await rotateCustomerSession(
+            req,
+            res,
+            validated.customer.id,
+            sidCookie,
+            true
+        );
+        res.json({
+            success: true,
+            data: {
+                refreshed: true,
+                csrfToken,
+            },
+        });
+        return;
+    }
+
     const token = req.cookies?.refreshToken as string | undefined;
-    if (!token) throw new UnauthorizedError('Refresh token missing');
+    if (!token) throw new UnauthorizedError('Refresh token or active session missing');
 
     const payload = verifyRefreshToken(token);
     const stored = await prisma.refreshToken.findUnique({
@@ -808,29 +861,33 @@ router.post('/refresh', async (req: Request, res: Response) => {
         role: payload.role,
     });
 
-    res.cookie('accessToken', accessToken, buildCookieOptions(15 * 60 * 1000));
-    res.setHeader('x-auth-token', accessToken);
+    res.cookie('accessToken', accessToken, buildCookieOptions(15 * 60 * 1000, req));
 
     res.json({
         success: true,
         data: {
-            token: accessToken,
-            accessToken,
+            refreshed: true,
         },
     });
 });
 
 router.post('/logout', async (req: Request, res: Response) => {
-    const token = req.cookies?.refreshToken as string | undefined;
-    if (token) {
-        await prisma.refreshToken.updateMany({
-            where: { tokenHash: hashToken(token) },
-            data: { revokedAt: new Date() },
-        });
+    const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
+    await revokeCustomerSession(sidCookie);
+
+    const refreshToken = req.cookies?.refreshToken as string | undefined;
+    if (refreshToken) {
+        await prisma.refreshToken
+            .updateMany({
+                where: { tokenHash: hashToken(refreshToken) },
+                data: { revokedAt: new Date() },
+            })
+            .catch(() => undefined);
     }
-    const clearOpts = buildCookieOptions();
-    res.clearCookie('accessToken', clearOpts);
-    res.clearCookie('refreshToken', clearOpts);
+
+    clearLegacyAndSessionCookies(res, req);
+    clearGuestSessionCookies(res, req);
+    res.clearCookie(CSRF_NONCE_COOKIE, buildCookieOptions(undefined, req));
     res.json({ success: true, message: 'Logged out successfully' });
 });
 

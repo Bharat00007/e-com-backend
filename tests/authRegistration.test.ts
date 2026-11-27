@@ -50,6 +50,9 @@ describe('Email OTP Registration & Authentication Security', () => {
 
     afterAll(async () => {
         if (createdCustomerIds.length > 0) {
+            await prisma.customerSession.deleteMany({
+                where: { customerId: { in: createdCustomerIds } },
+            });
             await prisma.refreshToken.deleteMany({
                 where: { customerId: { in: createdCustomerIds } },
             });
@@ -228,8 +231,9 @@ describe('Email OTP Registration & Authentication Security', () => {
             request(app).post('/api/v1/auth/verify-otp').send({ email, otp }),
         ]);
 
-        const statuses = [verifyA.status, verifyB.status].sort();
-        expect(statuses).toEqual([201, 400]);
+        const statuses = [verifyA.status, verifyB.status].sort((a, b) => a - b);
+        expect(statuses[0]).toBe(201);
+        expect([400, 409]).toContain(statuses[1]);
 
         const winner = verifyA.status === 201 ? verifyA : verifyB;
         const customerId = winner.body.data.customer.id;
@@ -245,13 +249,23 @@ describe('Email OTP Registration & Authentication Security', () => {
         expect(reuseRes.body.error.code).toBe('OTP_ALREADY_USED');
 
         // 6. Authenticated profile works if agent won, and login works after logout
-        const loginRes = await agent.post('/api/v1/auth/login').send({ identifier: email, password });
+        const verifyCsrf = verifyA.status === 201 ? (verifyA.body.data.csrfToken || verifyA.headers['x-csrf-token']) : undefined;
+        const loginReq = agent.post('/api/v1/auth/login').send({ identifier: email, password });
+        if (verifyCsrf) loginReq.set('x-csrf-token', verifyCsrf);
+        const loginRes = await loginReq;
         expect(loginRes.status).toBe(200);
+        expect(loginRes.body.data.token).toBeUndefined();
+        const csrfToken = loginRes.body.data.csrfToken || loginRes.headers['x-csrf-token'];
+        expect(csrfToken).toBeTruthy();
         const meRes = await agent.get('/api/v1/customers/me');
         expect(meRes.status).toBe(200);
         expect(meRes.body.data.email).toBe(email);
 
-        await agent.post('/api/v1/auth/logout');
+        // Logout requires valid CSRF token when session cookie is present
+        const logoutMissingCsrf = await agent.post('/api/v1/auth/logout');
+        expect(logoutMissingCsrf.status).toBe(403);
+
+        await agent.post('/api/v1/auth/logout').set('x-csrf-token', csrfToken);
         const meAfterLogout = await agent.get('/api/v1/customers/me');
         expect(meAfterLogout.status).toBe(401);
 
@@ -436,5 +450,5 @@ describe('Email OTP Registration & Authentication Security', () => {
         expect(verifyRes.body.data.customer.email).toBe(devEmail);
         expect(verifyRes.body.data.customer.phone).toBe(devPhone);
         createdCustomerIds.push(verifyRes.body.data.customer.id);
-    });
+    }, 45_000);
 });

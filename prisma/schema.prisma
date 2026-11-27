@@ -99,6 +99,13 @@ enum SubscriptionStatus {
   PAST_DUE
 }
 
+enum CartStatus {
+  ACTIVE
+  MERGED
+  CONSUMED
+  EXPIRED
+}
+
 // ==========================================
 // CUSTOMER MANAGEMENT
 // ==========================================
@@ -119,6 +126,7 @@ model Customer {
   updatedAt           DateTime      @updatedAt
 
   addresses     Address[]
+  sessions      CustomerSession[]
   refreshTokens RefreshToken[]
   cart          Cart?
   orders        Order[]
@@ -175,6 +183,44 @@ model Address {
 
   @@index([customerId])
   @@index([pincode])
+}
+
+model CustomerSession {
+  id             String    @id @default(cuid())
+  tokenHash      String    @unique
+  csrfSecret     String
+  customerId     String
+  userAgent      String?
+  ipAddress      String?
+  lastActivityAt DateTime  @default(now())
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@index([tokenHash])
+  @@index([expiresAt])
+}
+
+model GuestSession {
+  id                   String    @id @default(cuid())
+  tokenHash            String    @unique
+  csrfSecret           String
+  userAgent            String?
+  ipAddress            String?
+  lastActivityAt       DateTime  @default(now())
+  expiresAt            DateTime
+  consumedAt           DateTime?
+  consumedByCustomerId String?
+  revokedAt            DateTime?
+  createdAt            DateTime  @default(now())
+
+  cart Cart?
+
+  @@index([tokenHash])
+  @@index([expiresAt])
 }
 
 model RefreshToken {
@@ -296,17 +342,24 @@ model ProductVariant {
 // ==========================================
 
 model Cart {
-  id           String   @id @default(cuid())
-  customerId   String?  @unique
-  guestToken   String?  @unique
-  couponCode   String?
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id               String     @id @default(cuid())
+  customerId       String?    @unique
+  guestToken       String?    @unique
+  guestSessionId   String?    @unique
+  status           CartStatus @default(ACTIVE)
+  mergedIntoCartId String?
+  mergedAt         DateTime?
+  couponCode       String?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
 
-  customer Customer?  @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  items    CartItem[]
+  customer     Customer?     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  guestSession GuestSession? @relation(fields: [guestSessionId], references: [id], onDelete: Cascade)
+  items        CartItem[]
 
   @@index([guestToken])
+  @@index([guestSessionId])
+  @@index([status])
 }
 
 model CartItem {

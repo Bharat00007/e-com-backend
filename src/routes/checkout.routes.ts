@@ -8,6 +8,8 @@ import { AppError, BadRequestError, ConflictError } from '../utils/errors';
 import { calculateCartTotals } from '../services/cartCalculator';
 import { checkPincodeServiceability } from '../services/shippingProvider';
 import { isRazorpayConfigured } from '../services/paymentGateway';
+import { validateGuestSession } from '../services/sessionService';
+import { GUEST_SESSION_COOKIE } from '../utils/cookies';
 
 const router = Router();
 
@@ -44,12 +46,11 @@ router.post('/quote', optionalCustomerAuth, async (req: Request, res: Response) 
             },
         });
     } else {
-        const guestToken =
-            (req.headers['x-guest-cart-token'] as string | undefined)?.trim() ||
-            (req.cookies?.guestCartToken as string | undefined)?.trim();
-        if (guestToken) {
-            cart = await prisma.cart.findUnique({
-                where: { guestToken },
+        const gsid = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+        const guestSession = req.guestSession ?? (gsid ? await validateGuestSession(gsid) : null);
+        if (guestSession) {
+            cart = await prisma.cart.findFirst({
+                where: { guestSessionId: guestSession.id, status: 'ACTIVE' },
                 include: {
                     items: {
                         include: {

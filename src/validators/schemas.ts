@@ -66,6 +66,7 @@ export const loginSchema = z.object({
       identifier: z.string().trim().min(3, 'Email address is required').optional(),
       email: z.string().trim().toLowerCase().email('Please enter a valid email address').optional(),
       password: z.string().min(1, 'Password is required'),
+      rememberMe: z.boolean().optional(),
     })
     .strict()
     .superRefine((data, ctx) => {

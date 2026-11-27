@@ -22,6 +22,8 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
             await prisma.order.deleteMany({ where: { id: { in: createdOrderIds } } });
         }
         if (createdCustomerIds.length > 0) {
+            await prisma.customerSession.deleteMany({ where: { customerId: { in: createdCustomerIds } } });
+            await prisma.guestSession.deleteMany({ where: { consumedByCustomerId: { in: createdCustomerIds } } });
             await prisma.refreshToken.deleteMany({ where: { customerId: { in: createdCustomerIds } } });
             await prisma.cart.deleteMany({ where: { customerId: { in: createdCustomerIds } } });
             await prisma.wishlist.deleteMany({ where: { customerId: { in: createdCustomerIds } } });
@@ -83,24 +85,33 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
             isSubscription: false,
         });
         expect(guestAdd.status).toBe(201);
+        let csrfA = guestAdd.headers['x-csrf-token'];
+        expect(csrfA).toBeTruthy();
 
-        const regAInit = await agentA.post('/api/v1/auth/register').send({
-            fullName: 'QA Workflow Parent A',
-            email: emailA,
-            password: 'QaPassword#2026',
-            marketingConsent: false,
-        });
+        const regAInit = await agentA
+            .post('/api/v1/auth/register')
+            .set('x-csrf-token', csrfA)
+            .send({
+                fullName: 'QA Workflow Parent A',
+                email: emailA,
+                password: 'QaPassword#2026',
+                marketingConsent: false,
+            });
         expect(regAInit.status).toBe(202);
         const otpA = regAInit.body.data.devOtp || lastOtp;
-        const regA = await agentA.post('/api/v1/auth/verify-otp').send({ email: emailA, otp: otpA });
+        const regA = await agentA
+            .post('/api/v1/auth/verify-otp')
+            .set('x-csrf-token', csrfA)
+            .send({ email: emailA, otp: otpA });
         expect(regA.status).toBe(201);
+        csrfA = regA.body.data.csrfToken || regA.headers['x-csrf-token'];
         createdCustomerIds.push(regA.body.data.customer.id);
 
         // Guest cart item must be merged & preserved immediately upon OTP verification
         const mergedCart = await agentA.get('/api/v1/cart');
         expect(mergedCart.status).toBe(200);
         expect(mergedCart.body.data.items).toHaveLength(1);
-        await agentA.delete(`/api/v1/cart/items/${mergedCart.body.data.items[0].id}`);
+        await agentA.delete(`/api/v1/cart/items/${mergedCart.body.data.items[0].id}`).set('x-csrf-token', csrfA);
 
         const regBInit = await agentB.post('/api/v1/auth/register').send({
             fullName: 'QA Workflow Parent B',
@@ -112,6 +123,7 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
         const otpB = regBInit.body.data.devOtp || lastOtp;
         const regB = await agentB.post('/api/v1/auth/verify-otp').send({ email: emailB, otp: otpB });
         expect(regB.status).toBe(201);
+        const csrfB = regB.body.data.csrfToken || regB.headers['x-csrf-token'];
         createdCustomerIds.push(regB.body.data.customer.id);
 
         // 1. Customer cannot access admin routes (401/403)
@@ -128,13 +140,16 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
             state: 'Maharashtra',
             pincode: '411001',
         };
-        const emptyCheckout = await agentA.post('/api/v1/checkout/create-order').send({
-            contactEmail: `qa.wf.a.${ts}@example.in`,
-            contactPhone: '9876543210',
-            shippingAddress: address,
-            shippingMethod: 'standard',
-            paymentMethod: 'COD',
-        });
+        const emptyCheckout = await agentA
+            .post('/api/v1/checkout/create-order')
+            .set('x-csrf-token', csrfA)
+            .send({
+                contactEmail: `qa.wf.a.${ts}@example.in`,
+                contactPhone: '9876543210',
+                shippingAddress: address,
+                shippingMethod: 'standard',
+                paymentMethod: 'COD',
+            });
         expect(emptyCheckout.status).toBe(400);
 
         // 3. Look up real product variant and verify over-stock quantity rejection
@@ -144,44 +159,56 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
         const variant = product.variants[0];
         const initialStock: number = variant.stockQuantity;
 
-        const overMaxRes = await agentA.post('/api/v1/cart/items').send({
-            variantId: variant.id,
-            quantity: 25,
-            isSubscription: false,
-        });
+        const overMaxRes = await agentA
+            .post('/api/v1/cart/items')
+            .set('x-csrf-token', csrfA)
+            .send({
+                variantId: variant.id,
+                quantity: 25,
+                isSubscription: false,
+            });
         expect(overMaxRes.status).toBe(400);
 
         // 4. Add 1 unit to cart as Customer A
-        const addRes = await agentA.post('/api/v1/cart/items').send({
-            variantId: variant.id,
-            quantity: 1,
-            isSubscription: false,
-        });
+        const addRes = await agentA
+            .post('/api/v1/cart/items')
+            .set('x-csrf-token', csrfA)
+            .send({
+                variantId: variant.id,
+                quantity: 1,
+                isSubscription: false,
+            });
         expect(addRes.status).toBe(201);
         expect(addRes.body.data.items).toHaveLength(1);
 
         // 5. Reject UPI/CARD when Razorpay keys are unconfigured (503)
-        const upiRes = await agentA.post('/api/v1/checkout/create-order').send({
-            idempotencyKey: `idem-upi-${ts}`,
-            contactEmail: `qa.wf.a.${ts}@example.in`,
-            contactPhone: '9876543210',
-            shippingAddress: address,
-            shippingMethod: 'standard',
-            paymentMethod: 'UPI',
-        });
+        const upiRes = await agentA
+            .post('/api/v1/checkout/create-order')
+            .set('x-csrf-token', csrfA)
+            .send({
+                idempotencyKey: `idem-upi-${ts}`,
+                contactEmail: `qa.wf.a.${ts}@example.in`,
+                contactPhone: '9876543210',
+                shippingAddress: address,
+                shippingMethod: 'standard',
+                paymentMethod: 'UPI',
+            });
         expect(upiRes.status).toBe(503);
         expect(upiRes.body.error.code).toBe('PAYMENT_GATEWAY_NOT_CONFIGURED');
 
         // 6. Place real COD order -> CONFIRMED, paymentMethod=COD, paymentStatus=PENDING, unique SNC- order number
         const idemKey = `idem-cod-${ts}`;
-        const codRes = await agentA.post('/api/v1/checkout/create-order').send({
-            idempotencyKey: idemKey,
-            contactEmail: `qa.wf.a.${ts}@example.in`,
-            contactPhone: '9876543210',
-            shippingAddress: address,
-            shippingMethod: 'standard',
-            paymentMethod: 'COD',
-        });
+        const codRes = await agentA
+            .post('/api/v1/checkout/create-order')
+            .set('x-csrf-token', csrfA)
+            .send({
+                idempotencyKey: idemKey,
+                contactEmail: `qa.wf.a.${ts}@example.in`,
+                contactPhone: '9876543210',
+                shippingAddress: address,
+                shippingMethod: 'standard',
+                paymentMethod: 'COD',
+            });
         expect(codRes.status).toBe(201);
         const createdOrder = codRes.body.data;
         createdOrderIds.push(createdOrder.id);
@@ -195,18 +222,22 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
         const crossOrderRead = await agentB.get(`/api/v1/orders/${createdOrder.orderNumber}`);
         expect(crossOrderRead.status).toBe(404);
 
-        const crossIdemAttempt = await agentB.post('/api/v1/checkout/create-order').send({
-            idempotencyKey: idemKey,
-            contactEmail: `qa.wf.b.${ts}@example.in`,
-            contactPhone: '9876543211',
-            shippingAddress: address,
-            shippingMethod: 'standard',
-            paymentMethod: 'COD',
-        });
+        const crossIdemAttempt = await agentB
+            .post('/api/v1/checkout/create-order')
+            .set('x-csrf-token', csrfB)
+            .send({
+                idempotencyKey: idemKey,
+                contactEmail: `qa.wf.b.${ts}@example.in`,
+                contactPhone: '9876543211',
+                shippingAddress: address,
+                shippingMethod: 'standard',
+                paymentMethod: 'COD',
+            });
         expect(crossIdemAttempt.status).toBe(409);
 
         const crossPaymentAttempt = await agentB
             .post('/api/v1/payments/create-gateway-order')
+            .set('x-csrf-token', csrfB)
             .send({ orderId: createdOrder.id });
         expect(crossPaymentAttempt.status).toBe(403);
 
@@ -214,7 +245,9 @@ describe('Storefront workflows, COD checkout, stock checks & authorization', () 
         const afterOrderVariant = await prisma.productVariant.findUnique({ where: { id: variant.id } });
         expect(afterOrderVariant?.stockQuantity).toBe(initialStock - 1);
 
-        const cancelRes = await agentA.post(`/api/v1/orders/${createdOrder.id}/cancel`);
+        const cancelRes = await agentA
+            .post(`/api/v1/orders/${createdOrder.id}/cancel`)
+            .set('x-csrf-token', csrfA);
         expect(cancelRes.status).toBe(200);
         expect(cancelRes.body.data.status).toBe('CANCELLED');
 

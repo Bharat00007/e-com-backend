@@ -16,6 +16,7 @@ const envSchema = z.object({
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
   COOKIE_DOMAIN: z.string().optional(),
   COOKIE_SAME_SITE: z.enum(['lax', 'strict', 'none']).optional(),
+  CSRF_SECRET: z.string().min(16).default('dev_csrf_secret_change_in_production_32ch'),
   SEED_DEMO_CUSTOMER: z.enum(['true', 'false']).default('false'),
   RAZORPAY_KEY_ID: z.string().default(''),
   RAZORPAY_KEY_SECRET: z.string().default(''),

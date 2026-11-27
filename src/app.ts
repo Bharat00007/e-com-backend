@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -8,27 +9,12 @@ import { env } from './config/env';
 import { swaggerSpec } from './config/swagger';
 import { generalApiLimiter } from './middleware/rateLimit';
 import { errorHandler } from './middleware/errorHandler';
+import { csrfProtection } from './middleware/csrf';
+import { isOriginAllowed } from './utils/origins';
 import apiV1Router from './routes';
 
 export function createApp() {
   const app = express();
-  const allowedOrigins = env.FRONTEND_URL.split(',')
-    .map((o) => o.trim())
-    .filter(Boolean);
-
-  const isOriginAllowed = (origin?: string): boolean => {
-    if (!origin) return true;
-    if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return true;
-    // Allow any localhost or 127.0.0.1 port (frontend dev server, Swagger UI on 4000, etc.)
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) {
-      return true;
-    }
-    // Allow any Vercel deployment domain
-    if (/^https?:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin)) {
-      return true;
-    }
-    return false;
-  };
 
   app.set('trust proxy', 1);
   app.use(helmet());
@@ -42,12 +28,30 @@ export function createApp() {
         callback(null, false);
       },
       credentials: true,
-      exposedHeaders: ['x-auth-token', 'x-guest-cart-token'],
+      exposedHeaders: ['x-csrf-token', 'x-request-id'],
     })
   );
   app.use(cookieParser());
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
+
+  // Safe diagnostic request logging & correlation ID (no tokens, cookies, passwords, or OTPs logged)
+  app.use((req, res, next) => {
+    const reqId =
+      (req.headers['x-request-id'] as string | undefined)?.slice(0, 64) || crypto.randomUUID();
+    req.requestId = reqId;
+    res.setHeader('x-request-id', reqId);
+
+    const start = Date.now();
+    res.on('finish', () => {
+      if (env.NODE_ENV !== 'test') {
+        const duration = Date.now() - start;
+        console.log(`[API] ${req.method} ${req.originalUrl.split('?')[0]} ${res.statusCode} ${duration}ms reqId=${reqId}`);
+      }
+    });
+    next();
+  });
+
   app.use('/api', generalApiLimiter);
 
   const healthHandler = async (_req: express.Request, res: express.Response) => {
@@ -82,7 +86,7 @@ export function createApp() {
   app.get('/api/v1/health', healthHandler);
 
   app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-  app.use('/api/v1', apiV1Router);
+  app.use('/api/v1', csrfProtection, apiV1Router);
 
   app.use(errorHandler);
   return app;

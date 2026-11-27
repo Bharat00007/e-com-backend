@@ -1,16 +1,21 @@
 import { Router, Request, Response } from 'express';
-import crypto from 'crypto';
 import { prisma } from '../config/prisma';
 import { optionalCustomerAuth, requireCustomerAuth } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { cartAddSchema, cartUpdateSchema } from '../validators/schemas';
 import { BadRequestError, NotFoundError } from '../utils/errors';
 import { calculateCartTotals } from '../services/cartCalculator';
-import { buildCookieOptions } from '../utils/cookies';
+import {
+  clearMergedGuestCookie,
+  computeSessionCsrfToken,
+  createGuestSession,
+  mergeGuestSessionCartAtomically,
+  validateGuestSession,
+} from '../services/sessionService';
+import { GUEST_SESSION_COOKIE } from '../utils/cookies';
 
 const EMPTY_CART_RESPONSE = {
   id: null,
-  guestToken: null,
   couponCode: null,
   items: [],
   totals: {
@@ -27,27 +32,27 @@ const EMPTY_CART_RESPONSE = {
 const router = Router();
 router.use(optionalCustomerAuth);
 
-// In-memory idempotency cache (15-second TTL per operation key)
+// In-memory idempotency cache (15-second TTL per operation key scoped by owner)
 interface CachedCartOp {
   timestamp: number;
   data: unknown;
 }
 const idempotencyCache = new Map<string, CachedCartOp>();
 
-function getCachedOp(key?: string) {
+function getCachedOp(ownerKey: string, key?: string) {
   if (!key) return null;
-  const entry = idempotencyCache.get(key);
+  const scopedKey = `${ownerKey}:${key}`;
+  const entry = idempotencyCache.get(scopedKey);
   if (entry && Date.now() - entry.timestamp < 15000) {
     return entry.data;
   }
-  if (entry) idempotencyCache.delete(key);
+  if (entry) idempotencyCache.delete(scopedKey);
   return null;
 }
 
-function setCachedOp(key: string | undefined, data: unknown) {
+function setCachedOp(ownerKey: string, key: string | undefined, data: unknown) {
   if (!key) return;
-  idempotencyCache.set(key, { timestamp: Date.now(), data });
-  // Opportunistic purge
+  idempotencyCache.set(`${ownerKey}:${key}`, { timestamp: Date.now(), data });
   if (idempotencyCache.size > 2000) {
     const now = Date.now();
     for (const [k, v] of idempotencyCache.entries()) {
@@ -56,40 +61,49 @@ function setCachedOp(key: string | undefined, data: unknown) {
   }
 }
 
-async function resolveCart(
-  req: Request,
-  res: Response,
-  createIfMissing: boolean
-) {
+async function resolveCart(req: Request, res: Response, createIfMissing: boolean) {
+  // 1. Authenticated customer cart (strictly bound to req.customer.id)
   if (req.customer) {
     let cart = await prisma.cart.findUnique({ where: { customerId: req.customer.id } });
     if (!cart && createIfMissing) {
-      cart = await prisma.cart.create({ data: { customerId: req.customer.id } });
+      cart = await prisma.cart.create({ data: { customerId: req.customer.id, status: 'ACTIVE' } });
+    } else if (cart && cart.status !== 'ACTIVE') {
+      cart = await prisma.cart.update({ where: { id: cart.id }, data: { status: 'ACTIVE' } });
     }
     return cart;
   }
 
-  let guestToken =
-    (req.headers['x-guest-cart-token'] as string | undefined)?.trim() ||
-    (req.cookies?.guestCartToken as string | undefined)?.trim() ||
-    (req.body?.guestToken as string | undefined)?.trim();
+  // 2. Guest cart (strictly bound to server-issued HttpOnly `gsid` PostgreSQL GuestSession)
+  let guestSession =
+    req.guestSession ?? (await validateGuestSession(req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined));
 
-  if (!guestToken) {
+  if (!guestSession) {
     if (!createIfMissing) return null;
-    guestToken = crypto.randomUUID();
-    res.cookie('guestCartToken', guestToken, buildCookieOptions(30 * 24 * 60 * 60 * 1000));
+    const created = await createGuestSession(req, res);
+    guestSession = { id: created.session.id, csrfSecret: created.session.csrfSecret };
+    req.guestSession = guestSession;
+  } else {
+    const csrfToken = computeSessionCsrfToken(guestSession.id, guestSession.csrfSecret);
+    res.setHeader('x-csrf-token', csrfToken);
   }
 
-  res.setHeader('x-guest-cart-token', guestToken);
+  let cart = await prisma.cart.findFirst({
+    where: { guestSessionId: guestSession.id, status: 'ACTIVE' },
+  });
 
-  let cart = await prisma.cart.findUnique({ where: { guestToken } });
   if (!cart && createIfMissing) {
-    cart = await prisma.cart.create({ data: { guestToken } });
+    cart = await prisma.cart.create({
+      data: {
+        guestSessionId: guestSession.id,
+        status: 'ACTIVE',
+      },
+    });
   }
+
   return cart;
 }
 
-async function formatCartResponse(cartId: string, res?: Response) {
+async function formatCartResponse(cartId: string) {
   const cart = await prisma.cart.findUniqueOrThrow({
     where: { id: cartId },
     include: {
@@ -105,10 +119,6 @@ async function formatCartResponse(cartId: string, res?: Response) {
       },
     },
   });
-
-  if (cart.guestToken && res) {
-    res.setHeader('x-guest-cart-token', cart.guestToken);
-  }
 
   const coupon = cart.couponCode
     ? await prisma.coupon.findUnique({ where: { code: cart.couponCode } })
@@ -126,7 +136,6 @@ async function formatCartResponse(cartId: string, res?: Response) {
 
   return {
     id: cart.id,
-    guestToken: cart.guestToken,
     couponCode: cart.couponCode,
     items: cart.items,
     totals,
@@ -134,28 +143,23 @@ async function formatCartResponse(cartId: string, res?: Response) {
 }
 
 router.get('/', async (req: Request, res: Response) => {
-  const guestHeader = (req.headers['x-guest-cart-token'] as string | undefined)?.trim();
-  const guestCookie = req.cookies?.guestCartToken as string | undefined;
-
-  if (!req.customer && !guestHeader && !guestCookie) {
-    res.json({ success: true, data: EMPTY_CART_RESPONSE });
-    return;
-  }
   const cart = await resolveCart(req, res, false);
   if (!cart) {
     res.json({ success: true, data: EMPTY_CART_RESPONSE });
     return;
   }
-  const formatted = await formatCartResponse(cart.id, res);
+  const formatted = await formatCartResponse(cart.id);
   res.json({ success: true, data: formatted });
 });
 
 router.post('/items', validate(cartAddSchema), async (req: Request, res: Response) => {
+  const cart = (await resolveCart(req, res, true))!;
+  const ownerKey = req.customer ? `c:${req.customer.id}` : `g:${cart.id}`;
   const idempotencyKey =
     (req.headers['x-idempotency-key'] as string | undefined) ||
     (req.body.idempotencyKey as string | undefined);
 
-  const cached = getCachedOp(idempotencyKey);
+  const cached = getCachedOp(ownerKey, idempotencyKey);
   if (cached) {
     return res.status(200).json({ success: true, data: cached, idempotent: true });
   }
@@ -169,7 +173,6 @@ router.post('/items', validate(cartAddSchema), async (req: Request, res: Respons
     throw new BadRequestError(`Only ${variant.stockQuantity} units available in stock`);
   }
 
-  const cart = (await resolveCart(req, res, true))!;
   const existing = await prisma.cartItem.findUnique({
     where: {
       cartId_variantId_isSubscription: {
@@ -201,8 +204,8 @@ router.post('/items', validate(cartAddSchema), async (req: Request, res: Respons
     });
   }
 
-  const formatted = await formatCartResponse(cart.id, res);
-  setCachedOp(idempotencyKey, formatted);
+  const formatted = await formatCartResponse(cart.id);
+  setCachedOp(ownerKey, idempotencyKey, formatted);
   res.status(201).json({ success: true, data: formatted });
 });
 
@@ -229,7 +232,7 @@ router.patch('/items/:itemId', validate(cartUpdateSchema), async (req: Request, 
     await prisma.cartItem.update({ where: { id: item.id }, data: req.body });
   }
 
-  const formatted = await formatCartResponse(cart.id, res);
+  const formatted = await formatCartResponse(cart.id);
   res.json({ success: true, data: formatted });
 });
 
@@ -246,11 +249,10 @@ router.delete('/items/:itemId', async (req: Request, res: Response) => {
       OR: [{ id: itemId }, { variantId: itemId }],
     },
   });
-  const formatted = await formatCartResponse(cart.id, res);
+  const formatted = await formatCartResponse(cart.id);
   res.json({ success: true, data: formatted });
 });
 
-// Dedicated Clear Cart endpoint
 router.delete('/', async (req: Request, res: Response) => {
   const cart = await resolveCart(req, res, false);
   if (!cart) {
@@ -259,7 +261,7 @@ router.delete('/', async (req: Request, res: Response) => {
   }
   await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
   await prisma.cart.update({ where: { id: cart.id }, data: { couponCode: null } });
-  const formatted = await formatCartResponse(cart.id, res);
+  const formatted = await formatCartResponse(cart.id);
   res.json({ success: true, data: formatted });
 });
 
@@ -269,7 +271,7 @@ router.post('/coupon', async (req: Request, res: Response) => {
 
   if (!code) {
     await prisma.cart.update({ where: { id: cart.id }, data: { couponCode: null } });
-    return res.json({ success: true, data: await formatCartResponse(cart.id, res) });
+    return res.json({ success: true, data: await formatCartResponse(cart.id) });
   }
 
   const coupon = await prisma.coupon.findUnique({ where: { code: code.trim().toUpperCase() } });
@@ -278,118 +280,45 @@ router.post('/coupon', async (req: Request, res: Response) => {
   }
 
   await prisma.cart.update({ where: { id: cart.id }, data: { couponCode: coupon.code } });
-  res.json({ success: true, data: await formatCartResponse(cart.id, res) });
+  res.json({ success: true, data: await formatCartResponse(cart.id) });
 });
 
-// Explicit Guest-to-Customer Cart Merge endpoint
+/**
+ * Idempotent Guest-to-Customer Cart Merge endpoint.
+ * Merges ONLY the verified GuestSession (`gsid` HttpOnly cookie) into the authenticated customer's cart.
+ * Never trusts client-submitted guest IDs or client-submitted item arrays.
+ */
 router.post('/merge', requireCustomerAuth, async (req: Request, res: Response) => {
   const customerId = req.customer!.id;
-  const guestToken =
-    (req.body?.guestToken as string | undefined)?.trim() ||
-    (req.headers['x-guest-cart-token'] as string | undefined)?.trim() ||
-    (req.cookies?.guestCartToken as string | undefined)?.trim();
+  const gsidCookie = req.cookies?.[GUEST_SESSION_COOKIE] as string | undefined;
+  const guestSession = gsidCookie ? await validateGuestSession(gsidCookie) : null;
 
-  let customerCart = await prisma.cart.findUnique({
-    where: { customerId },
-    include: { items: true },
-  });
-  if (!customerCart) {
-    customerCart = await prisma.cart.create({
-      data: { customerId },
-      include: { items: true },
-    });
-  }
+  const mergeResult = await mergeGuestSessionCartAtomically(guestSession?.id, customerId);
+  clearMergedGuestCookie(res, req);
 
-  let mergedCount = 0;
-  const existingMap = new Map(
-    customerCart.items.map((ci) => [`${ci.variantId}:${ci.isSubscription}`, ci])
-  );
-
-  // 1. Merge by guestToken in database
-  if (guestToken) {
-    const guestCart = await prisma.cart.findUnique({
-      where: { guestToken },
-      include: { items: { include: { variant: true } } },
-    });
-
-    if (guestCart && guestCart.items.length > 0) {
-      for (const item of guestCart.items) {
-        const key = `${item.variantId}:${item.isSubscription}`;
-        const existing = existingMap.get(key);
-        const maxStock = item.variant.stockQuantity;
-
-        if (existing) {
-          const combinedQty = Math.min(existing.quantity + item.quantity, maxStock);
-          await prisma.cartItem.update({
-            where: { id: existing.id },
-            data: { quantity: combinedQty },
-          });
-          mergedCount += 1;
-        } else {
-          const cappedQty = Math.min(item.quantity, maxStock);
-          const created = await prisma.cartItem.create({
-            data: {
-              cartId: customerCart.id,
-              variantId: item.variantId,
-              quantity: cappedQty,
-              isSubscription: item.isSubscription,
-              frequencyWeeks: item.frequencyWeeks,
-            },
-          });
-          existingMap.set(key, created);
-          mergedCount += 1;
-        }
-      }
-      await prisma.cart.delete({ where: { id: guestCart.id } });
+  if (!mergeResult.customerCartId) {
+    const customerCart = await prisma.cart.findUnique({ where: { customerId } });
+    if (!customerCart) {
+      res.json({
+        success: true,
+        data: { ...EMPTY_CART_RESPONSE, mergedCount: 0 },
+      });
+      return;
     }
+    const formatted = await formatCartResponse(customerCart.id);
+    res.json({
+      success: true,
+      data: { ...formatted, mergedCount: mergeResult.mergedCount },
+    });
+    return;
   }
 
-  // 2. Fallback: Merge explicit items array sent from frontend localStorage
-  const explicitItems = req.body?.items as
-    | Array<{ variantId: string; quantity: number; isSubscription?: boolean; frequencyWeeks?: number }>
-    | undefined;
-
-  if (Array.isArray(explicitItems) && explicitItems.length > 0) {
-    for (const item of explicitItems) {
-      const isSub = Boolean(item.isSubscription);
-      const key = `${item.variantId}:${isSub}`;
-      const existing = existingMap.get(key);
-
-      const variant = await prisma.productVariant.findUnique({ where: { id: item.variantId } });
-      if (!variant || !variant.isAvailable) continue;
-      const maxStock = variant.stockQuantity;
-
-      if (existing) {
-        const combinedQty = Math.min(existing.quantity + item.quantity, maxStock);
-        await prisma.cartItem.update({
-          where: { id: existing.id },
-          data: { quantity: combinedQty },
-        });
-        mergedCount += 1;
-      } else {
-        const cappedQty = Math.min(item.quantity, maxStock);
-        const created = await prisma.cartItem.create({
-          data: {
-            cartId: customerCart.id,
-            variantId: item.variantId,
-            quantity: cappedQty,
-            isSubscription: isSub,
-            frequencyWeeks: item.frequencyWeeks || 4,
-          },
-        });
-        existingMap.set(key, created);
-        mergedCount += 1;
-      }
-    }
-  }
-
-  res.clearCookie('guestCartToken');
-  const formatted = await formatCartResponse(customerCart.id, res);
+  const formatted = await formatCartResponse(mergeResult.customerCartId);
   res.json({
     success: true,
     data: {
       ...formatted,
-      mergedCount,
+      mergedCount: mergeResult.mergedCount,
     },
   });
 });
