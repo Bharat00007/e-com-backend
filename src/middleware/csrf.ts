@@ -75,12 +75,14 @@ export async function csrfProtection(
   }
 
   if (sidCookie) {
-    const validated = req.customerSession
-      ? { session: req.customerSession }
+    const validated = req.customerSession && req.customer
+      ? { session: req.customerSession, customer: req.customer }
       : await validateCustomerSession(sidCookie);
     if (validated) {
       const expected = computeSessionCsrfToken(validated.session.id, validated.session.csrfSecret);
       if (timingSafeTokenEqual(providedCsrf, expected)) {
+        if (!req.customer) req.customer = validated.customer;
+        if (!req.customerSession) req.customerSession = validated.session;
         next();
         return;
       }
@@ -94,6 +96,9 @@ export async function csrfProtection(
     if (guestSession) {
       const expected = computeSessionCsrfToken(guestSession.id, guestSession.csrfSecret);
       if (timingSafeTokenEqual(providedCsrf, expected)) {
+        if (!req.guestSession) {
+          req.guestSession = { id: guestSession.id, csrfSecret: guestSession.csrfSecret };
+        }
         next();
         return;
       }

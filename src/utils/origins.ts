@@ -14,5 +14,8 @@ export function isOriginAllowed(origin?: string): boolean {
   if (/^https?:\/\/([a-z0-9-]+\.)*vercel\.app$/i.test(origin)) {
     return true;
   }
+  if (/^https?:\/\/([a-z0-9-]+\.)*thesniff\.co$/i.test(origin)) {
+    return true;
+  }
   return false;
 }

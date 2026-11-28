@@ -19,6 +19,12 @@ export async function requireCustomerAuth(
   _res: Response,
   next: NextFunction
 ): Promise<void> {
+  // Fast path if session was already validated by earlier middleware (e.g. CSRF)
+  if (req.customer) {
+    next();
+    return;
+  }
+
   // 1. Primary path: PostgreSQL-backed opaque server session via HttpOnly `sid` cookie
   const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
   if (sidCookie) {
@@ -69,6 +75,12 @@ export async function optionalCustomerAuth(
   _res: Response,
   next: NextFunction
 ): Promise<void> {
+  // Fast path if session/guest was already validated by earlier middleware (e.g. CSRF)
+  if (req.customer || req.guestSession) {
+    next();
+    return;
+  }
+
   // 1. Check PostgreSQL CustomerSession (`sid` cookie)
   const sidCookie = req.cookies?.[CUSTOMER_SESSION_COOKIE] as string | undefined;
   if (sidCookie) {

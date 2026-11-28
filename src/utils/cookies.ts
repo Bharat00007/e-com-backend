@@ -52,6 +52,7 @@ export function buildCookieOptions(
         secure,
         sameSite,
         path: '/',
+        ...(sameSite === 'none' && secure ? { partitioned: true } : {}),
         ...(validDomain ? { domain: validDomain } : {}),
         ...(maxAge !== undefined ? { maxAge } : {}),
     };

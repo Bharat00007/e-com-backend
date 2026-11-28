@@ -80,6 +80,7 @@ router.get('/', async (req: Request, res: Response) => {
       ? products.length
       : await prisma.product.count({ where });
 
+  res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
   res.json({
     success: true,
     data: products,
